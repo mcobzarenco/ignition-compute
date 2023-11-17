@@ -1,0 +1,15 @@
+[package]
+name = "ignition-compute"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy = "0.12.0"
+bytemuck = "1.14.0"
+naga = { version = "0.13.0", features = ["wgsl-in"] }
+naga_oil = "0.10"
+parking_lot = "0.12.1"
+rand = "0.8.5"
+wgpu = { version = "0.17.1", features = ["naga"] }
