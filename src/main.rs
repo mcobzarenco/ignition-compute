@@ -1,20 +1,24 @@
+mod camera;
 mod compute;
+mod particle;
+mod shaders;
+mod spatial_index;
 
-use bevy::asset::load_internal_asset;
-use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::{
     core::Pod,
-    input::mouse::{MouseScrollUnit, MouseWheel},
-    math::vec2,
+    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     prelude::*,
-    render::camera::CameraProjection,
     sprite::{MaterialMesh2dBundle, Mesh2dHandle},
-    window::{PresentMode, PrimaryWindow, WindowPlugin},
+    window::{PresentMode, WindowPlugin},
 };
 use bytemuck::Zeroable;
 use rand::distributions::{Distribution, Uniform};
+use shaders::InternalComputeShader;
 
-use crate::compute::prelude::*;
+use crate::{
+    camera::{PanCam, PanCamPlugin},
+    compute::prelude::*,
+};
 
 const NUM_PARTICLES: u32 = 10000;
 
@@ -72,26 +76,6 @@ struct Density {
     number: f32,
 }
 
-#[derive(TypeUuid)]
-#[uuid = "2545ae14-a9bc-4f03-9ea4-4eb43d1075a7"]
-struct SphShader;
-
-impl ComputeShader for SphShader {
-    fn shader() -> ShaderRef {
-        SHADER_STATE_EQUATION.into()
-    }
-}
-
-#[derive(TypeUuid)]
-#[uuid = "5747af29-0ff7-4f3a-8051-a4ce52fcb4a8"]
-struct DensityShader;
-
-impl ComputeShader for DensityShader {
-    fn shader() -> ShaderRef {
-        SHADER_DENSITY.into()
-    }
-}
-
 struct BoidWorker;
 
 impl ComputeWorker for BoidWorker {
@@ -130,23 +114,18 @@ impl ComputeWorker for BoidWorker {
                     NUM_PARTICLES as usize
                 ],
             )
-            .add_pass::<DensityShader>(
-                [NUM_PARTICLES, 1, 1],
+            .add_pass::<shaders::DensityShader>(
+                [NUM_PARTICLES / 32 + 1, 1, 1],
                 &["params", "particles_src", "density"],
             )
-            .add_pass::<SphShader>(
-                [NUM_PARTICLES, 1, 1],
+            .add_pass::<shaders::StateEquationShader>(
+                [NUM_PARTICLES / 32 + 1, 1, 1],
                 &["params", "particles_src", "density", "particles_dst"],
             )
             .add_swap("particles_src", "particles_dst")
             .build()
     }
 }
-
-pub const SHADER_PARTICLE: Handle<Shader> = Handle::weak_from_u128(0x707e7e80c93ee200a46b);
-pub const SHADER_KERNEL: Handle<Shader> = Handle::weak_from_u128(0x71279d97245e1c73811f);
-pub const SHADER_DENSITY: Handle<Shader> = Handle::weak_from_u128(0x6819c0d826333dbc48fd);
-pub const SHADER_STATE_EQUATION: Handle<Shader> = Handle::weak_from_u128(0x0fe48356178fe2ee2509);
 
 fn main() {
     let mut app = App::new();
@@ -168,15 +147,12 @@ fn main() {
     .add_systems(Startup, setup)
     .add_systems(Update, move_entities);
 
-    load_internal_asset!(app, SHADER_PARTICLE, "sph/particle.wgsl", Shader::from_wgsl);
-    load_internal_asset!(app, SHADER_KERNEL, "sph/kernel.wgsl", Shader::from_wgsl);
-    load_internal_asset!(app, SHADER_DENSITY, "sph/density.wgsl", Shader::from_wgsl);
-    load_internal_asset!(
-        app,
-        SHADER_STATE_EQUATION,
-        "sph/state-equation.wgsl",
-        Shader::from_wgsl
-    );
+    // load_shaders(&mut app);
+
+    shaders::ParticleShader::load_shader(&mut app);
+    shaders::KernelShader::load_shader(&mut app);
+    shaders::DensityShader::load_shader(&mut app);
+    shaders::StateEquationShader::load_shader(&mut app);
 
     app.run();
 }
@@ -209,15 +185,6 @@ fn setup(
             ..default()
         },
     ));
-
-    // commands.spawn(Camera2dBundle {
-    //     projection: OrthographicProjection {
-    //         far: 1000.,
-    //         near: -1000.,
-    //         ..default()
-    //     },
-    //     ..default()
-    // });
 
     let boid_mesh = meshes.add(shape::Circle::new(params.particle_radius).into());
     let boid_material = materials.add(Color::ANTIQUE_WHITE.into());
@@ -270,257 +237,159 @@ fn move_entities(
         });
 }
 
-/// Plugin that adds the necessary systems for `PanCam` components to work
-#[derive(Default)]
-pub struct PanCamPlugin;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::{app::AppExit, render::RenderPlugin, window::ExitCondition, winit::WinitPlugin};
+    use rand::Rng;
 
-/// System set to allow ordering of `PanCamPlugin`
-#[derive(Debug, Clone, Copy, SystemSet, PartialEq, Eq, Hash)]
-pub struct PanCamSystemSet;
+    fn random_points(num_points: usize) -> Vec<Vec2> {
+        let mut rng = rand::thread_rng();
 
-impl Plugin for PanCamPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            (camera_movement, camera_zoom).in_set(PanCamSystemSet),
-        )
-        .register_type::<PanCam>();
-    }
-}
-
-fn camera_zoom(
-    mut query: Query<(&PanCam, &mut OrthographicProjection, &mut Transform)>,
-    mut scroll_events: EventReader<MouseWheel>,
-    primary_window: Query<&Window, With<PrimaryWindow>>,
-) {
-    let pixels_per_line = 100.; // Maybe make configurable?
-    let scroll = scroll_events
-        .read()
-        .map(|ev| match ev.unit {
-            MouseScrollUnit::Pixel => ev.y,
-            MouseScrollUnit::Line => ev.y * pixels_per_line,
-        })
-        .sum::<f32>();
-
-    if scroll == 0. {
-        return;
+        let mut points = Vec::new();
+        for _ in 0..num_points {
+            points.push(Vec2::new(
+                rng.gen_range(-3.0..3.0),
+                rng.gen_range(-3.0..3.0),
+            ))
+        }
+        points
     }
 
-    let window = primary_window.single();
-    let window_size = Vec2::new(window.width(), window.height());
-    let mouse_normalized_screen_pos = window
-        .cursor_position()
-        .map(|cursor_pos| (cursor_pos / window_size) * 2. - Vec2::ONE)
-        .map(|p| Vec2::new(p.x, -p.y));
+    type CellKey = u32;
+    type ParticleIndex = u32;
 
-    for (cam, mut proj, mut pos) in &mut query {
-        if cam.enabled {
-            let old_scale = proj.scale;
-            proj.scale = (proj.scale * (1. + -scroll * 0.001)).max(cam.min_scale);
+    #[derive(ShaderType, Pod, Zeroable, Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    struct SpatialIndexEntry {
+        cell_key: CellKey,
+        particle_index: ParticleIndex,
+    }
 
-            // Apply max scale constraint
-            if let Some(max_scale) = cam.max_scale {
-                proj.scale = proj.scale.min(max_scale);
-            }
+    struct SpatialIndexWorker;
 
-            // If there is both a min and max boundary, that limits how far we can zoom. Make sure we don't exceed that
-            let scale_constrained = BVec2::new(
-                cam.min_x.is_some() && cam.max_x.is_some(),
-                cam.min_y.is_some() && cam.max_y.is_some(),
+    impl ComputeWorker for SpatialIndexWorker {
+        fn build(world: &mut World) -> AppComputeWorker<Self> {
+            let params = world.get_resource::<Parameters>().unwrap().clone();
+            const NUM_PARTICLES: usize = 32;
+
+            let mut entries = Vec::with_capacity(NUM_PARTICLES);
+            entries.resize(
+                NUM_PARTICLES,
+                SpatialIndexEntry {
+                    cell_key: 0,
+                    particle_index: 21,
+                },
             );
 
-            if scale_constrained.x || scale_constrained.y {
-                let bounds_width = if let (Some(min_x), Some(max_x)) = (cam.min_x, cam.max_x) {
-                    max_x - min_x
-                } else {
-                    f32::INFINITY
-                };
+            // let mut rng = rand::thread_rng();
+            // let unif = Uniform::new_inclusive(-1.0, 1.0);
 
-                let bounds_height = if let (Some(min_y), Some(max_y)) = (cam.min_y, cam.max_y) {
-                    max_y - min_y
-                } else {
-                    f32::INFINITY
-                };
-
-                let bounds_size = vec2(bounds_width, bounds_height);
-                let max_safe_scale = max_scale_within_bounds(bounds_size, &proj, window_size);
-
-                if scale_constrained.x {
-                    proj.scale = proj.scale.min(max_safe_scale.x);
-                }
-
-                if scale_constrained.y {
-                    proj.scale = proj.scale.min(max_safe_scale.y);
-                }
+            let mut positions = Vec::with_capacity(NUM_PARTICLES);
+            for i in 0..NUM_PARTICLES {
+                positions.push(Vec2::new(
+                    i as f32,
+                    (i / 2) as f32,
+                    // (i % 3) as f32 * (params.particle_radius * 3.0) + 1.0 + params.x_min,
+                    // (i / 3) as f32 * (params.particle_radius * 3.0) + 1.0 + params.y_min,
+                ));
             }
 
-            // Move the camera position to normalize the projection window
-            if let (Some(mouse_normalized_screen_pos), true) =
-                (mouse_normalized_screen_pos, cam.zoom_to_cursor)
-            {
-                let proj_size = proj.area.max / old_scale;
-                let mouse_world_pos = pos.translation.truncate()
-                    + mouse_normalized_screen_pos * proj_size * old_scale;
-                pos.translation = (mouse_world_pos
-                    - mouse_normalized_screen_pos * proj_size * proj.scale)
-                    .extend(pos.translation.z);
+            let mut start_indices: Vec<u32> = Vec::with_capacity(NUM_PARTICLES);
+            start_indices.resize(NUM_PARTICLES, u32::MAX);
 
-                // As we zoom out, we don't want the viewport to move beyond the provided boundary. If the most recent
-                // change to the camera zoom would move cause parts of the window beyond the boundary to be shown, we
-                // need to change the camera position to keep the viewport within bounds. The four if statements below
-                // provide this behavior for the min and max x and y boundaries.
-                let proj_size = proj.area.size();
-
-                let half_of_viewport = proj_size / 2.;
-
-                if let Some(min_x_bound) = cam.min_x {
-                    let min_safe_cam_x = min_x_bound + half_of_viewport.x;
-                    pos.translation.x = pos.translation.x.max(min_safe_cam_x);
-                }
-                if let Some(max_x_bound) = cam.max_x {
-                    let max_safe_cam_x = max_x_bound - half_of_viewport.x;
-                    pos.translation.x = pos.translation.x.min(max_safe_cam_x);
-                }
-                if let Some(min_y_bound) = cam.min_y {
-                    let min_safe_cam_y = min_y_bound + half_of_viewport.y;
-                    pos.translation.y = pos.translation.y.max(min_safe_cam_y);
-                }
-                if let Some(max_y_bound) = cam.max_y {
-                    let max_safe_cam_y = max_y_bound - half_of_viewport.y;
-                    pos.translation.y = pos.translation.y.min(max_safe_cam_y);
-                }
-            }
+            AppComputeWorkerBuilder::new(world)
+                .add_uniform("params", &params)
+                .add_staging("positions", &positions)
+                .add_staging("entries", &entries)
+                .add_staging("start_indices", &start_indices)
+                .add_pass::<shaders::SpatialComputeEntriesShader>(
+                    [NUM_PARTICLES as u32 / 256 + 1, 1, 1],
+                    &["params", "positions", "entries"],
+                )
+                .add_pass::<shaders::SpatialSortEntriesShader>(
+                    [1, 1, 1],
+                    &["entries"],
+                )
+                .add_pass::<shaders::SpatialComputeStartIndices>(
+                    [NUM_PARTICLES as u32 / 256 + 1, 1, 1],
+                    &["entries", "start_indices"],
+                )
+                .one_shot()
+                .build()
         }
     }
-}
 
-/// max_scale_within_bounds is used to find the maximum safe zoom out/projection
-/// scale when we have been provided with minimum and maximum x boundaries for
-/// the camera.
-fn max_scale_within_bounds(
-    bounds_size: Vec2,
-    proj: &OrthographicProjection,
-    window_size: Vec2, //viewport?
-) -> Vec2 {
-    let mut p = proj.clone();
-    p.scale = 1.;
-    p.update(window_size.x, window_size.y);
-    let base_world_size = p.area.size();
-    bounds_size / base_world_size
-}
-
-fn camera_movement(
-    primary_window: Query<&Window, With<PrimaryWindow>>,
-    mouse_buttons: Res<Input<MouseButton>>,
-    mut query: Query<(&PanCam, &mut Transform, &OrthographicProjection)>,
-    mut last_pos: Local<Option<Vec2>>,
-) {
-    let window = primary_window.single();
-    let window_size = Vec2::new(window.width(), window.height());
-
-    // Use position instead of MouseMotion, otherwise we don't get acceleration movement
-    let current_pos = match window.cursor_position() {
-        Some(c) => Vec2::new(c.x, -c.y),
-        None => return,
-    };
-    let delta_device_pixels = current_pos - last_pos.unwrap_or(current_pos);
-
-    for (cam, mut transform, projection) in &mut query {
-        if cam.enabled
-            && cam
-                .grab_buttons
-                .iter()
-                .any(|btn| mouse_buttons.pressed(*btn))
-        {
-            let proj_size = projection.area.size();
-
-            let world_units_per_device_pixel = proj_size / window_size;
-
-            // The proposed new camera position
-            let delta_world = delta_device_pixels * world_units_per_device_pixel;
-            let mut proposed_cam_transform = transform.translation - delta_world.extend(0.);
-
-            // Check whether the proposed camera movement would be within the provided boundaries, override it if we
-            // need to do so to stay within bounds.
-            if let Some(min_x_boundary) = cam.min_x {
-                let min_safe_cam_x = min_x_boundary + proj_size.x / 2.;
-                proposed_cam_transform.x = proposed_cam_transform.x.max(min_safe_cam_x);
-            }
-            if let Some(max_x_boundary) = cam.max_x {
-                let max_safe_cam_x = max_x_boundary - proj_size.x / 2.;
-                proposed_cam_transform.x = proposed_cam_transform.x.min(max_safe_cam_x);
-            }
-            if let Some(min_y_boundary) = cam.min_y {
-                let min_safe_cam_y = min_y_boundary + proj_size.y / 2.;
-                proposed_cam_transform.y = proposed_cam_transform.y.max(min_safe_cam_y);
-            }
-            if let Some(max_y_boundary) = cam.max_y {
-                let max_safe_cam_y = max_y_boundary - proj_size.y / 2.;
-                proposed_cam_transform.y = proposed_cam_transform.y.min(max_safe_cam_y);
-            }
-
-            transform.translation = proposed_cam_transform;
-        }
+    fn start_compute_worker(mut worker: ResMut<AppComputeWorker<SpatialIndexWorker>>) {
+        // assert!(worker.ready());
+        println!("Starting compute worker");
+        worker.execute();
     }
-    *last_pos = Some(current_pos);
-}
 
-/// A component that adds panning camera controls to an orthographic camera
-#[derive(Component, Reflect)]
-#[reflect(Component)]
-pub struct PanCam {
-    /// The mouse buttons that will be used to drag and pan the camera
-    pub grab_buttons: Vec<MouseButton>,
-    /// Whether camera currently responds to user input
-    pub enabled: bool,
-    /// When true, zooming the camera will center on the mouse cursor
-    ///
-    /// When false, the camera will stay in place, zooming towards the
-    /// middle of the screen
-    pub zoom_to_cursor: bool,
-    /// The minimum scale for the camera
-    ///
-    /// The orthographic projection's scale will be clamped at this value when zooming in
-    pub min_scale: f32,
-    /// The maximum scale for the camera
-    ///
-    /// If present, the orthographic projection's scale will be clamped at
-    /// this value when zooming out.
-    pub max_scale: Option<f32>,
-    /// The minimum x position of the camera window
-    ///
-    /// If present, the orthographic projection will be clamped to this boundary both
-    /// when dragging the window, and zooming out.
-    pub min_x: Option<f32>,
-    /// The maximum x position of the camera window
-    ///
-    /// If present, the orthographic projection will be clamped to this boundary both
-    /// when dragging the window, and zooming out.
-    pub max_x: Option<f32>,
-    /// The minimum y position of the camera window
-    ///
-    /// If present, the orthographic projection will be clamped to this boundary both
-    /// when dragging the window, and zooming out.
-    pub min_y: Option<f32>,
-    /// The maximum y position of the camera window
-    ///
-    /// If present, the orthographic projection will be clamped to this boundary both
-    /// when dragging the window, and zooming out.
-    pub max_y: Option<f32>,
-}
-
-impl Default for PanCam {
-    fn default() -> Self {
-        Self {
-            grab_buttons: vec![MouseButton::Left, MouseButton::Right, MouseButton::Middle],
-            enabled: true,
-            zoom_to_cursor: true,
-            min_scale: 0.00001,
-            max_scale: None,
-            min_x: None,
-            max_x: None,
-            min_y: None,
-            max_y: None,
+    fn print_compute_shader_results(
+        worker: ResMut<AppComputeWorker<SpatialIndexWorker>>,
+        mut exit: EventWriter<AppExit>,
+    ) {
+        if !worker.ready() {
+            println!("Compute worker not ready");
+            return;
         }
+
+        println!("Done.");
+        println!("Entries");
+        for (i, x) in worker.read_vec::<SpatialIndexEntry>("entries").into_iter().enumerate() {  
+            println!("{}: {:?}", i, x);
+        }
+        println!("Start indices");
+        for (i, x) in worker.read_vec::<u32>("start_indices").into_iter().enumerate() {
+            println!("{}: {:?}", i, x);
+        }
+        exit.send(AppExit);
+
+        // for x in worker.read_vec::<Density>("density") {
+        //     println!("{:?}", x);
+        // }
+
+        // let boids = worker.read_vec::<Particle>("particles_dst");
+
+        // parameters.delta_time = time.delta_seconds() * 0.1;
+        // worker.write("params", parameters.as_ref());
+
+        // q_boid
+        //     .par_iter_mut()
+        //     .for_each(|(mut transform, boid_entity)| {
+        //         transform.translation = boids[boid_entity.0].position.extend(0.0);
+        //     });
+    }
+
+    #[test]
+    fn test_gpu_sort() {
+        let mut app = App::new();
+        app.add_plugins((DefaultPlugins
+            .set(WindowPlugin {
+                // primary_window: None,
+                // exit_condition: ExitCondition::DontExit,
+                ..default()
+            })
+            .set(WinitPlugin {
+                run_on_any_thread: true,
+            }),))
+            .add_plugins(AppComputePlugin)
+            .add_plugins(AppComputeWorkerPlugin::<SpatialIndexWorker>::default())
+            .insert_resource(Parameters::default())
+            .add_systems(Startup, start_compute_worker)
+            .add_systems(Update, print_compute_shader_results);
+
+        shaders::ParticleShader::load_shader(&mut app);
+        shaders::KernelShader::load_shader(&mut app);
+
+        // Spatial index
+        shaders::SpatialCommonShader::load_shader(&mut app);
+        shaders::SpatialComputeEntriesShader::load_shader(&mut app);
+        shaders::SpatialSortEntriesShader::load_shader(&mut app);
+        shaders::SpatialComputeStartIndices::load_shader(&mut app);
+
+
+        app.run();
     }
 }

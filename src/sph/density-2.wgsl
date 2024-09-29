@@ -1,10 +1,13 @@
 #import ignition::kernel::cubic_spline_kernel
 #import ignition::particle::{Density, Parameters, Particle}
-#import ignition::spatial_index::common::{Density, Parameters, Particle}
+#import ignition::spatial_index::common::{hash_position, SpatialIndexEntry}
 
 @group(0) @binding(0) var<uniform>              params: Parameters;
 @group(0) @binding(1) var<storage, read> particles_src: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> density: array<Density>;
+
+@group(0) @binding(3) var<storage, read> si_entries: array<SpatialIndexEntry>;
+@group(0) @binding(4) var<storage, read> si_start_indices: array<u32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) invocation_id: vec3<u32>) {

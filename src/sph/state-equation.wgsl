@@ -10,7 +10,7 @@ const GAS_CONSTANT: f32 = 1000.0;
 const REST_DENSITY: f32 = 16.0; 
 const GAMMA: f32 = 3.0; // "adiabatic index"
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     let num_particles = arrayLength(&particles_src);
 
